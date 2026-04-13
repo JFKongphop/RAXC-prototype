@@ -22,6 +22,8 @@ COLLECTION = "defi_exploits"
 EMBED_MODEL = "text-embedding-3-small"
 TOP_K = 5
 CODE_TRUNCATE = 6000
+SIM_THRESHOLD = 0.60   # skip GPT-4o if top similarity below this
+CONF_THRESHOLD = 60    # treat as safe if model confidence below this
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +80,21 @@ def analyze(contract_code: str) -> tuple:
     print(f"[*] Retrieving {TOP_K} most similar exploits from Qdrant...")
     results = retrieve(contract_code)
 
+    top_sim = results[0].score if results else 0.0
+    print(f"[*] Top similarity score: {round(top_sim, 3)}")
+
+    if top_sim < SIM_THRESHOLD:
+        print(f"[!] Similarity {round(top_sim, 3)} below threshold {SIM_THRESHOLD} — skipping GPT-4o, contract appears safe.")
+        report = (
+            "**Vulnerability Found:** No\n"
+            "**Risk Level:** None\n"
+            "**Vulnerability Type:** N/A\n"
+            "**Similar Exploit Reference:** NONE\n"
+            f"**Explanation:** Top similarity score ({round(top_sim, 3)}) is below the "
+            f"minimum threshold ({SIM_THRESHOLD}). No sufficiently similar exploit pattern found in the database."
+        )
+        return report, results
+
     print("[*] Building prompt and calling GPT-4o...\n")
     context = build_context(results)
 
@@ -92,11 +109,22 @@ Use the real-world exploit cases below (retrieved from DeFiHackLabs) as referenc
 ## Contract to Analyze:
 {contract_code}
 
+## Critical instructions before answering:
+1. The exploit cases show HOW past vulnerabilities worked. Your job is to determine if THIS contract has the same UNMITIGATED flaw — not just a similar structure.
+2. Actively check for these mitigations. If any are correctly implemented, they PREVENT exploitation:
+   - ReentrancyGuard modifier or Checks-Effects-Interactions (state update before external call)
+   - TWAP / time-weighted average price oracle (resistant to single-block manipulation)
+   - onlyOwner / role-based access control on sensitive functions
+   - Solidity 0.8+ built-in overflow protection or SafeMath
+3. Structural similarity to an exploit is NOT sufficient. The contract must have the same exploitable flaw WITH NO mitigation present.
+4. Include a CONFIDENCE score (0-100) reflecting how certain you are a real exploitable vulnerability exists with no mitigation.
+
 ## Provide a structured security report with the following sections:
 
 **Vulnerability Found:** Yes / No
 **Risk Level:** Critical / High / Medium / Low / None
 **Vulnerability Type:** (e.g. Reentrancy, Flash Loan, Price Manipulation, Access Control, etc.)
+**Confidence:** (0-100 — certainty that a real exploitable vulnerability exists with no mitigation present)
 **Similar Exploit Reference:** (which exploit case above is most relevant and why)
 **Explanation:** (describe the exact vulnerability and how an attacker could exploit it step-by-step)
 **Recommendation:** Show the FIXED version of the vulnerable code as a complete Solidity snippet. Do not give bullet points — write the corrected contract code directly with inline comments explaining each fix.
@@ -107,8 +135,21 @@ Use the real-world exploit cases below (retrieved from DeFiHackLabs) as referenc
         messages=[{"role": "user", "content": prompt}],
         max_tokens=3000,
     )
+    report = response.choices[0].message.content
 
-    return response.choices[0].message.content, results
+    # Confidence gate — override to safe if model isn't confident enough
+    conf = 50
+    for line in report.splitlines():
+        if line.strip().lower().startswith("**confidence:**"):
+            try:
+                conf = int(line.split(":", 1)[1].strip().split()[0])
+            except (ValueError, IndexError):
+                pass
+    if conf < CONF_THRESHOLD:
+        print(f"[!] Model confidence {conf} below threshold {CONF_THRESHOLD} — overriding to No vulnerability.")
+        report = report.replace("**Vulnerability Found:** Yes", "**Vulnerability Found:** No (low confidence override)")
+
+    return report, results
 
 
 # ---------------------------------------------------------------------------
