@@ -1,4 +1,7 @@
 .env
-datasets
+datasets-protocol-exploit
+datasets-case-exploit
 .DS_Store
 reports
+*.png
+research
