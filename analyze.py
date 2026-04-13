@@ -6,6 +6,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import datetime
 from pathlib import Path
@@ -18,12 +19,15 @@ load_dotenv()
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 qdrant = QdrantClient("localhost", port=6333)
 
-COLLECTION = "defi_exploits"
-EMBED_MODEL = "text-embedding-3-small"
-TOP_K = 5
+# Collections queried during retrieval
+COLL_PROTOCOLS  = "defi_protocols"   # datasets-protocol-exploit real attacks
+COLL_CASES      = "defi_cases"       # DeFiVulnLabs educational patterns
+
+EMBED_MODEL   = "text-embedding-3-small"
+TOP_K         = 5     # results per collection
 CODE_TRUNCATE = 6000
-SIM_THRESHOLD = 0.60   # skip GPT-4o if top similarity below this
-CONF_THRESHOLD = 60    # treat as safe if model confidence below this
+SIM_THRESHOLD = 0.60  # skip GPT-4o if top similarity below this
+CONF_THRESHOLD = 60   # treat as safe if model confidence below this
 
 
 # ---------------------------------------------------------------------------
@@ -36,21 +40,34 @@ def embed(text: str) -> list[float]:
     return response.data[0].embedding
 
 
+def _query_collection(vector: list, collection: str, top_k: int) -> list:
+    """Query a single collection, return empty list if collection doesn't exist."""
+    try:
+        return qdrant.query_points(
+            collection_name=collection,
+            query=vector,
+            limit=top_k * 2,
+            with_payload=True,
+        ).points
+    except Exception:
+        return []
+
+
 def retrieve(contract_code: str, top_k: int = TOP_K) -> list:
     vector = embed(contract_code)
-    # Fetch extra results to account for deduplication
-    results = qdrant.query_points(
-        collection_name=COLLECTION,
-        query=vector,
-        limit=top_k * 3,
-        with_payload=True,
-    ).points
+
+    # Query both collections
+    raw: list = []
+    raw += _query_collection(vector, COLL_PROTOCOLS, top_k)
+    raw += _query_collection(vector, COLL_CASES,     top_k)
+
     # Deduplicate by exploit_name, keep highest score
-    seen = {}
-    for r in results:
+    seen: dict = {}
+    for r in raw:
         name = r.payload.get("exploit_name", "")
         if name not in seen or r.score > seen[name].score:
             seen[name] = r
+
     # Return top_k unique results sorted by score
     return sorted(seen.values(), key=lambda x: x.score, reverse=True)[:top_k]
 
@@ -59,13 +76,31 @@ def build_context(results: list) -> str:
     context = ""
     for i, r in enumerate(results):
         p = r.payload
-        score = round(r.score, 3)
+        score  = round(r.score, 3)
+        source = p.get("source", "DeFiHackLabs")
+        is_real = source != "DeFiVulnLabs"
+
+        header = f"--- Reference {i+1}: {p['exploit_name']} ({p['date']}) [similarity: {score}] [source: {source}] ---"
+        chain  = f"Chain: {p['chain']}"
+
+        if is_real:
+            # Real exploit — show actual loss and tx
+            attack_tx = p.get('attack_tx', 'unknown')
+            tx_line   = f"Attack Tx: {attack_tx}"
+            lost_line = f"Total Lost: {p.get('total_lost', 'unknown')}"
+            type_line = ""
+        else:
+            # Educational pattern — no real tx or loss
+            tx_line   = "Attack Tx: N/A (educational pattern — no on-chain incident)"
+            lost_line = "Total Lost: N/A"
+            type_line = f"Vulnerability Type: {p.get('vuln_type', 'unknown')}\n"
+
         context += f"""
---- Exploit {i+1}: {p['exploit_name']} ({p['date']}) [similarity: {score}] ---
-Chain: {p['chain']}
-Total Lost: {p['total_lost']}
-Attack Tx: {p['attack_tx']}
-Vulnerable Contract: {p['vulnerable_contract']}
+{header}
+{chain}
+{lost_line}
+{tx_line}
+{type_line}Vulnerable Contract: {p.get('vulnerable_contract', 'unknown')}
 Code Snippet:
 {p['code'][:1500]}
 """
@@ -73,11 +108,57 @@ Code Snippet:
 
 
 # ---------------------------------------------------------------------------
+# Function-level exploit matching
+# ---------------------------------------------------------------------------
+
+def extract_functions(code: str) -> dict:
+    """Extract individual Solidity function bodies keyed by name."""
+    functions = {}
+    for m in re.finditer(r'\bfunction\s+(\w+)\s*\(', code):
+        name = m.group(1)
+        start = m.start()
+        brace_pos = code.find('{', m.end())
+        if brace_pos == -1:
+            continue
+        depth = 0
+        end = brace_pos
+        for i in range(brace_pos, len(code)):
+            if code[i] == '{':
+                depth += 1
+            elif code[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        functions[name] = code[start:end]
+    return functions
+
+
+def match_functions(contract_code: str, top_k: int = 3) -> list:
+    """Embed each function individually and find its top matching exploit cases."""
+    functions = extract_functions(contract_code)
+    results = []
+    for func_name, func_body in functions.items():
+        vector = embed(func_body)
+        raw = []
+        raw += _query_collection(vector, COLL_PROTOCOLS, top_k)
+        raw += _query_collection(vector, COLL_CASES,     top_k)
+        seen = {}
+        for r in raw:
+            name = r.payload.get("exploit_name", "")
+            if name not in seen or r.score > seen[name].score:
+                seen[name] = r
+        top = sorted(seen.values(), key=lambda x: x.score, reverse=True)[:top_k]
+        results.append({"function": func_name, "matches": top})
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Analysis
 # ---------------------------------------------------------------------------
 
 def analyze(contract_code: str) -> tuple:
-    print(f"[*] Retrieving {TOP_K} most similar exploits from Qdrant...")
+    print(f"[*] Retrieving top {TOP_K} results from defi_protocols + defi_cases...")
     results = retrieve(contract_code)
 
     top_sim = results[0].score if results else 0.0
@@ -101,9 +182,9 @@ def analyze(contract_code: str) -> tuple:
     prompt = f"""You are a smart contract security expert specializing in DeFi vulnerabilities.
 
 Analyze the following Solidity contract for potential vulnerabilities.
-Use the real-world exploit cases below (retrieved from DeFiHackLabs) as reference — these are the most similar past attacks based on semantic similarity.
+Use the reference cases below as context — retrieved from DeFiHackLabs (real protocol attacks) and DeFiVulnLabs (educational vulnerability patterns).
 
-## Similar Real-World Exploit Cases from DeFiHackLabs:
+## Similar Reference Cases (DeFiHackLabs real exploits + DeFiVulnLabs educational patterns):
 {context}
 
 ## Contract to Analyze:
@@ -118,6 +199,7 @@ Use the real-world exploit cases below (retrieved from DeFiHackLabs) as referenc
    - Solidity 0.8+ built-in overflow protection or SafeMath
 3. Structural similarity to an exploit is NOT sufficient. The contract must have the same exploitable flaw WITH NO mitigation present.
 4. Include a CONFIDENCE score (0-100) reflecting how certain you are a real exploitable vulnerability exists with no mitigation.
+5. For EXPLOIT_TX in your report: only cite the exact Attack Tx URLs present in the reference cases above. If a reference shows "N/A" or no real tx, write N/A. Do NOT fabricate or invent transaction hashes.
 
 ## Provide a structured security report with the following sections:
 
@@ -127,13 +209,21 @@ Use the real-world exploit cases below (retrieved from DeFiHackLabs) as referenc
 **Confidence:** (0-100 — certainty that a real exploitable vulnerability exists with no mitigation present)
 **Similar Exploit Reference:** (which exploit case above is most relevant and why)
 **Explanation:** (describe the exact vulnerability and how an attacker could exploit it step-by-step)
-**Recommendation:** Show the FIXED version of the vulnerable code as a complete Solidity snippet. Do not give bullet points — write the corrected contract code directly with inline comments explaining each fix.
+**Recommendation:**
+Separate each distinct issue or improvement into its own labeled case (A, B, C, ...). For each case:
+- State the problem in one sentence.
+- Show ONLY the one affected function rewritten in full — do NOT include contract declaration, constructor, imports, structs, or any other functions.
+- Every line of the function must be written out completely — the words "existing code", "existing logic", "..." and any placeholder comments are FORBIDDEN.
+- Add an inline comment on every line you changed explaining what was fixed and why.
+- If a vulnerability was found: each case must directly correspond to one finding named in the Explanation section.
+- If no vulnerability was found: each case must apply a concrete proactive improvement (e.g. access control, input validation, oracle integration, checks-effects-interactions) to one specific sensitive function.
+- You MUST write ALL cases completely. Do NOT summarize, skip, or abbreviate any case. Do NOT end with a generic note like "apply similar changes elsewhere" — write each case in full.
 """
 
     response = openai_client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=3000,
+        max_tokens=8000,
     )
     report = response.choices[0].message.content
 
@@ -615,51 +705,143 @@ contract Zringotts is MerkleTreeWithHistory, ReentrancyGuard {
 }
 """
 
-def save_markdown(report: str, results: list, contract_name: str = "contract") -> str:
+def _sim_badge(score: float) -> str:
+    """Return a text badge for a similarity score."""
+    if score >= 0.65:
+        return "🔴 HIGH"
+    elif score >= 0.55:
+        return "🟡 MED"
+    else:
+        return "🟢 LOW"
+
+
+def _parse_report_fields(report: str) -> dict:
+    """Extract structured fields from the GPT-4o report text."""
+    fields = {"vuln_found": "Unknown", "risk_level": "Unknown", "vuln_type": "N/A", "confidence": "?"}
+    for line in report.splitlines():
+        l = line.strip().lower()
+        if l.startswith("**vulnerability found:**"):
+            fields["vuln_found"] = line.split(":", 1)[1].strip().strip("*").strip()
+        elif l.startswith("**risk level:**"):
+            fields["risk_level"] = line.split(":", 1)[1].strip().strip("*").strip()
+        elif l.startswith("**vulnerability type:**"):
+            fields["vuln_type"] = line.split(":", 1)[1].strip().strip("*").strip()
+        elif l.startswith("**confidence:**"):
+            try:
+                fields["confidence"] = int(line.split(":", 1)[1].strip().split()[0].strip("*"))
+            except (ValueError, IndexError):
+                pass
+    return fields
+
+
+def _verdict_banner(fields: dict) -> list:
+    """Build a prominent verdict banner for the top of the report."""
+    vuln = fields["vuln_found"].lower()
+    risk = fields["risk_level"].lower()
+    conf = fields["confidence"]
+
+    if "yes" in vuln:
+        if "critical" in risk:
+            icon, bar = "🚨", "CRITICAL VULNERABILITY FOUND"
+        elif "high" in risk:
+            icon, bar = "🔴", "HIGH RISK VULNERABILITY FOUND"
+        elif "medium" in risk:
+            icon, bar = "🟠", "MEDIUM RISK VULNERABILITY FOUND"
+        else:
+            icon, bar = "🟡", "LOW RISK VULNERABILITY FOUND"
+    else:
+        icon, bar = "✅", "NO EXPLOITABLE VULNERABILITY FOUND"
+
+    return [
+        f"> ## {icon} {bar}",
+        f"> **Risk Level:** {fields['risk_level']}  |  **Type:** {fields['vuln_type']}  |  **Confidence:** {conf}/100",
+        "",
+    ]
+
+
+def save_markdown(report: str, results: list, contract_name: str = "contract", func_matches: list = None) -> str:
     """Save the report as a clean markdown file and return the path."""
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path("reports")
     out_dir.mkdir(exist_ok=True)
     filepath = out_dir / f"RAXC_{contract_name}_{timestamp}.md"
 
+    fields = _parse_report_fields(report)
+
     lines = []
+
+    # ── Header ──────────────────────────────────────────────────────────────
     lines.append("# RAXC Security Report")
-    lines.append(f"> Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"> Contract: `{contract_name}`")
+    lines.append(f"> **Generated:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ")
+    lines.append(f"> **Contract:** `{contract_name}`  ")
+    lines.append(f"> **Dataset:** DeFiHackLabs (real exploits) + DeFiVulnLabs (educational patterns)  ")
+    lines.append(f"> **Model:** GPT-4o  |  **Embeddings:** text-embedding-3-small")
     lines.append("")
     lines.append("---")
     lines.append("")
-    lines.append("## Top 5 Similar Exploits (DeFiHackLabs)")
+
+    # ── Verdict banner ───────────────────────────────────────────────────────
+    lines += _verdict_banner(fields)
+    lines.append("---")
     lines.append("")
-    lines.append("| # | Exploit | Date | Chain | Lost | Similarity |")
-    lines.append("|---|---------|------|-------|------|------------|")
+
+    # ── Top similar exploits ─────────────────────────────────────────────────
+    lines.append("## Top Similar Exploit References")
+    lines.append("")
+    lines.append("")
+    lines.append("| # | Exploit | Date | Chain | Total Lost | Similarity |")
+    lines.append("|---|---------|------|-------|------------|------------|")
     for i, r in enumerate(results):
         p = r.payload
         score = round(r.score, 3)
-        tx = p['attack_tx']
-        tx_link = f"[tx]({tx})" if tx.startswith("http") else tx
-        lines.append(f"| {i+1} | **{p['exploit_name']}** | {p['date']} | {p['chain']} | {p['total_lost']} | {score} |")
-    lines.append("")
-    lines.append("### Exploit Transaction Links")
-    lines.append("")
-    for i, r in enumerate(results):
-        p = r.payload
-        tx = p['attack_tx']
-        if tx.startswith("http"):
-            lines.append(f"{i+1}. [{p['exploit_name']}]({tx})")
-        else:
-            lines.append(f"{i+1}. {p['exploit_name']} — {tx}")
+        exploit_name = p['exploit_name']
+        tx = p.get('attack_tx', 'unknown')
+        name_cell = f"[{exploit_name}]({tx})" if tx.startswith("http") else exploit_name
+        badge = _sim_badge(score)
+        lines.append(f"| {i+1} | **{name_cell}** | {p['date']} | {p['chain']} | {p.get('total_lost', 'unknown')} | {score} {badge} |")
     lines.append("")
     lines.append("---")
     lines.append("")
-    lines.append("## Analysis")
+
+    # ── Function exploit matching ─────────────────────────────────────────────
+    if func_matches:
+        lines.append("## Function-Level Exploit Matching")
+        lines.append("")
+        lines.append("*Each contract function embedded and matched independently against the exploit database.*")
+        lines.append("")
+        lines.append("| Similarity | Meaning |")
+        lines.append("|-----------|---------|")
+        lines.append("| 🔴 ≥ 0.65 | High — strong structural match to known exploit |")
+        lines.append("| 🟡 0.55–0.65 | Medium — partial overlap with exploit pattern |")
+        lines.append("| 🟢 < 0.55 | Low — weak or incidental similarity |")
+        lines.append("")
+        for fm in func_matches:
+            top_score = fm["matches"][0].score if fm["matches"] else 0
+            badge = _sim_badge(top_score)
+            lines.append(f"### `{fm['function']}` {badge}")
+            lines.append("")
+            lines.append("| # | Exploit | Date | Chain | Total Lost | Similarity |")
+            lines.append("|---|---------|------|-------|------------|------------|")
+            for j, r in enumerate(fm["matches"]):
+                p = r.payload
+                score = round(r.score, 3)
+                tx = p.get('attack_tx', 'unknown')
+                name = p['exploit_name']
+                name_cell = f"[{name}]({tx})" if tx.startswith("http") else name
+                lines.append(f"| {j+1} | **{name_cell}** | {p['date']} | {p['chain']} | {p.get('total_lost','N/A')} | {score} {_sim_badge(score)} |")
+            lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    # ── Analysis & Recommendation ─────────────────────────────────────────────
+    lines.append("## Analysis & Recommendation")
     lines.append("")
     lines.append(report)
     lines.append("")
     lines.append("---")
     lines.append("")
-    lines.append("> *Powered by RAXC — RAG-based smart contract vulnerability scanner*")
-    lines.append("> *Dataset: DeFiHackLabs | Embeddings: OpenAI text-embedding-3-small | LLM: GPT-4o*")
+    lines.append("> *Powered by RAXC — RAG-based smart contract vulnerability scanner*  ")
+    lines.append("> *Embeddings: OpenAI text-embedding-3-small · LLM: GPT-4o · Vector DB: Qdrant*")
 
     filepath.write_text("\n".join(lines), encoding="utf-8")
     return str(filepath)
@@ -680,6 +862,9 @@ if __name__ == "__main__":
 
     report, results = analyze(contract_code)
 
+    print("[*] Running function-level exploit matching...")
+    func_matches = match_functions(contract_code)
+
     print("=" * 60)
     print("TOP 5 SIMILAR EXPLOITS (from DeFiHackLabs)")
     print("=" * 60)
@@ -695,6 +880,17 @@ if __name__ == "__main__":
         print()
 
     print("=" * 60)
+    print("FUNCTION EXPLOIT MATCHING")
+    print("=" * 60)
+    for fm in func_matches:
+        print(f"\n  [{fm['function']}]")
+        for j, r in enumerate(fm["matches"]):
+            p = r.payload
+            src = p.get("source", "DeFiHackLabs")
+            print(f"    #{j+1}  {p['exploit_name']:<30}  score={round(r.score, 3)}  chain={p['chain']}  lost={p.get('total_lost','N/A')}  [{src}]")
+    print()
+
+    print("=" * 60)
     print("RAXC SECURITY REPORT")
     print("=" * 60)
     print(report)
@@ -702,5 +898,5 @@ if __name__ == "__main__":
 
     # Save markdown report
     contract_name = Path(sys.argv[1]).stem if len(sys.argv) > 1 else "sample"
-    md_path = save_markdown(report, results, contract_name)
+    md_path = save_markdown(report, results, contract_name, func_matches=func_matches)
     print(f"\n[*] Report saved → {md_path}")
