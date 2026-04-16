@@ -11,9 +11,19 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000)
 
+## Configuration
+
+Create `.env.local` file (already included):
+
+```env
+NEXT_PUBLIC_API_URL=http://localhost:8080
+```
+
+For production, update the API URL to your deployed backend.
+
 ## Requirements
 
-- RAXC API running at `http://localhost:8080`
+- RAXC API running (default: `http://localhost:8080`)
 - Node.js 18+
 
 ## Features

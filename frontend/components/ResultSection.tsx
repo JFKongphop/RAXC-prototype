@@ -12,7 +12,7 @@ export function ResultSection({ result }: ResultSectionProps) {
 
   useEffect(() => {
     if (result?.download_url) {
-      fetch(`http://localhost:8080${result.download_url}`)
+      fetch(`${process.env.NEXT_PUBLIC_API_URL}${result.download_url}`)
         .then(res => res.text())
         .then(setReportContent)
         .catch(console.error);
@@ -75,7 +75,7 @@ export function ResultSection({ result }: ResultSectionProps) {
 
         {result.download_url && (
           <a
-            href={`http://localhost:8080${result.download_url}`}
+            href={`${process.env.NEXT_PUBLIC_API_URL}${result.download_url}`}
             download
             className="btn btn-secondary"
             style={{ width: '100%', justifyContent: 'center', marginTop: 12 }}

@@ -13,7 +13,7 @@ export default function Home() {
     setResult(null);
 
     try {
-      const response = await fetch('http://localhost:8080/analyze', {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contract, name }),
