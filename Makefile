@@ -52,3 +52,5 @@ eval-quick:
 	/usr/bin/python3 evaluate.py --quick
 
 .PHONY: start check index demo analyze run stop reports eval eval-quick
+
+sd: docker run -d --name raxc-api -p 8080:8080 --env-file .env raxc-api && sleep 2 && docker logs raxc-api
