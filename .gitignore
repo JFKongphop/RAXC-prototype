@@ -5,3 +5,5 @@ datasets-case-exploit
 reports
 *.png
 research
+target
+example.sol

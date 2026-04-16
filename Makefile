@@ -42,4 +42,13 @@ reports:
 	@echo "── Saved Reports ──────────────────"
 	@ls -lt reports/*.md 2>/dev/null || echo "No reports yet"
 
-.PHONY: start check index demo analyze run stop reports
+# ── Evaluate: baseline vs optimized configs ────────────────────────────────
+eval:
+	@echo "[*] Running RAXC evaluation (full 10 contracts)..."
+	/usr/bin/python3 evaluate.py
+
+eval-quick:
+	@echo "[*] Running RAXC quick evaluation (5 contracts)..."
+	/usr/bin/python3 evaluate.py --quick
+
+.PHONY: start check index demo analyze run stop reports eval eval-quick

@@ -1,0 +1,24 @@
+# Build artifacts
+target/
+
+# Secrets — never bake into image
+.env
+
+# Dev/research files not needed at runtime
+datasets-case-exploit/
+datasets-protocol-exploit/
+research/
+reports/
+python/
+
+# Scripts and misc
+*.sh
+*.py
+*.md
+*.txt
+*.json
+*.png
+
+# Git
+.git/
+.gitignore
