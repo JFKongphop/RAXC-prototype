@@ -24,6 +24,7 @@ use axum::{
     Json, Router,
 };
 use raxc::{analyze, build_markdown, build_qdrant, load_env, match_functions, parse_report_fields};
+use tower_http::cors::{Any, CorsLayer};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -159,10 +160,16 @@ async fn main() -> anyhow::Result<()> {
         reports: Mutex::new(HashMap::new()),
     });
 
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     let app = Router::new()
         .route("/analyze", post(handle_analyze))
         .route("/reports/*filename", get(download_report))
         .route("/health", get(health))
+        .layer(cors)
         .with_state(state);
 
     let addr = "0.0.0.0:8080";
