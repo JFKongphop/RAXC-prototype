@@ -40,7 +40,7 @@ export default function Home() {
           RAXC Security Scanner
         </h1>
         <p style={{ fontSize: 18, color: 'var(--text-muted)', maxWidth: 600, margin: '0 auto' }}>
-          RAG-powered vulnerability detection using real exploit patterns from DeFiHackLabs
+          RAG-powered vulnerability detection using real exploit patterns
         </p>
       </div>
 
